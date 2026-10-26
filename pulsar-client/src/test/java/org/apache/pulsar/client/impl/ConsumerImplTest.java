@@ -24,13 +24,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.atLeast;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.withSettings;
 import static org.testng.Assert.assertTrue;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -41,21 +44,27 @@ import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
+import org.apache.pulsar.client.api.BatchReceivePolicy;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.ConsumerInterceptor;
 import org.apache.pulsar.client.api.Message;
@@ -67,11 +76,14 @@ import org.apache.pulsar.client.api.Messages;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.api.SubscriptionMode;
+import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
 import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
 import org.apache.pulsar.client.impl.conf.TopicConsumerConfigurationData;
 import org.apache.pulsar.client.util.ExecutorProvider;
 import org.apache.pulsar.client.util.ScheduledExecutorProvider;
+import org.apache.pulsar.common.api.proto.BaseCommand;
 import org.apache.pulsar.common.api.proto.CommandMessage;
 import org.apache.pulsar.common.api.proto.CompressionType;
 import org.apache.pulsar.common.api.proto.MessageIdData;
@@ -109,9 +121,14 @@ public class ConsumerImplTest {
         createConsumer(consumerConf, topicName, null);
     }
 
-    @SuppressWarnings({"rawtypes", "unchecked"})
     private void createConsumer(ConsumerConfigurationData consumerConf, String topicName,
                                 ConsumerInterceptor<byte[]> interceptor) {
+        createConsumer(consumerConf, topicName, interceptor, null);
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private void createConsumer(ConsumerConfigurationData consumerConf, String topicName,
+                                ConsumerInterceptor<byte[]> interceptor, Schema<byte[]> schema) {
         cleanup();
         executorProvider = new ExecutorProvider(1, "ConsumerImplTest");
         internalExecutor = Executors.newSingleThreadScheduledExecutor();
@@ -126,7 +143,7 @@ public class ConsumerImplTest {
         ConsumerInterceptors<byte[]> interceptors =
                 interceptor == null ? null : new ConsumerInterceptors<>(Collections.singletonList(interceptor));
         consumer = ConsumerImpl.newConsumerImpl(client, topicName, consumerConf,
-                executorProvider, -1, false, subscribeFuture, null, null, interceptors,
+                executorProvider, -1, false, subscribeFuture, null, schema, interceptors,
                 true);
         consumer.setState(HandlerState.State.Ready);
     }
@@ -156,7 +173,7 @@ public class ConsumerImplTest {
      * the receiver delivers chunk 0, marks the ctx as already expired (receivedTime = 0), then delivers a late chunk 1
      * that writes into the same {@code chunkedMsgBuffer} — exactly when the expiry task may release/recycle that ctx.
      * Without serialization this races (use-after-free / double-recycle). With the fix, both paths take
-     * chunkedMessageLock, so it passes and pendingChunkedMessageCount stays equal to chunkedMessagesMap.size().
+     * chunkedMessageLock, so it passes.
      */
     @Test(timeOut = 60000)
     public void testChunkedMessageCountRaceBetweenReceiveAndExpiry() throws Exception {
@@ -226,10 +243,6 @@ public class ConsumerImplTest {
                 throw new AssertionError(
                         "chunked-message bookkeeping race: concurrent ctx/buffer access corrupted state", error.get());
             }
-            int count = target.pendingChunkedMessageCount;
-            int mapSize = target.chunkedMessagesMap.size();
-            Assert.assertEquals(count, mapSize, "pendingChunkedMessageCount (" + count
-                    + ") drifted from chunkedMessagesMap.size() (" + mapSize + ")");
         } finally {
             // Partial buffers can be released only once no worker can touch them any more; if one is still running
             // after the bounded wait, leaking them is preferable to a use-after-free.
@@ -299,37 +312,24 @@ public class ConsumerImplTest {
 
     /**
      * When a duplicated first chunk (chunkId == 0, redelivered) arrives for a uuid that already has an
-     * in-progress ctx, the old ctx is replaced: removing/recycling it must be paired with decrementing
-     * pendingChunkedMessageCount before the unconditional increment for the new ctx, so the counter stays
-     * equal to the real number of in-progress chunked messages (chunkedMessagesMap.size()).
+     * in-progress ctx, the old ctx is replaced, so the uuid is still tracked exactly once.
      */
     @Test
-    public void testDuplicateFirstChunkOvercountsPendingChunkedMessageCount() throws Exception {
+    public void testDuplicateFirstChunkReplacesInProgressCtx() throws Exception {
         // Disable the lazy expiry self-scheduling so this test doesn't need a scheduled-executor mock.
         consumer.expireTimeOfIncompleteChunkedMessageMillis = 0L;
 
         final String uuid = "uuid-dup";
         try {
             // Deliver the first chunk (chunkId == 0) twice for the SAME uuid and SAME (ledgerId, entryId): a
-            // redelivered first chunk of a 2-chunk message. The message never completes, so only the ++/--
+            // redelivered first chunk of a 2-chunk message. The message never completes, so only the replacement
             // bookkeeping is exercised.
             for (int call = 0; call < 2; call++) {
                 sendChunk(uuid, 0, 2);
             }
 
-            int count = consumer.pendingChunkedMessageCount;
-            int mapSize = consumer.chunkedMessagesMap.size();
-            Assert.assertEquals(count, mapSize,
-                    "a redelivered first chunk over-counted pendingChunkedMessageCount (" + count
-                            + ") vs chunkedMessagesMap.size() (" + mapSize + ")");
-
-            // Only this single uuid is ever enqueued, so the queue size equals its occurrence count. After a
-            // redelivered first chunk it must be exactly 1 (stale entry removed, re-added once) — not 2 as the old
-            // double-enqueue did. (GrowableArrayBlockingQueue intentionally doesn't support iteration, so assert on
-            // size().)
-            Assert.assertEquals(consumer.pendingChunkedMessageUuidQueue.size(), 1,
-                    "uuid should appear exactly once in pendingChunkedMessageUuidQueue but queue size was "
-                            + consumer.pendingChunkedMessageUuidQueue.size());
+            Assert.assertEquals(consumer.chunkedMessagesMap.size(), 1,
+                    "a redelivered first chunk must replace, not add, the in-progress ctx");
         } finally {
             // The message is never completed, so its partial buffer is still live: release it even if an assertion
             // above failed.
@@ -354,83 +354,23 @@ public class ConsumerImplTest {
     }
 
     /**
-     * A uuid whose ctx is no longer in {@code chunkedMessagesMap} but still sits at the head of
-     * {@code pendingChunkedMessageUuidQueue} is a "ghost" head. Every removal path now drops the queue entry along
-     * with the map entry, so this is a defensive invariant of {@code removeExpireIncompleteChunkedMessages}: it must
-     * drop such null-ctx heads and keep scanning (as {@code removeOldestPendingChunkedMessage} does), because a ghost
-     * that stopped the scan would leave every genuinely-expired incomplete chunk behind it uncleaned (its
-     * {@code chunkedMsgBuffer} leaked and its chunks never acked), which is what happened before this invariant was
-     * enforced.
+     * The "lost first chunk" / forward-gap discard path in {@code processMessageChunk} must remove the in-progress ctx
+     * from {@code chunkedMessagesMap}.
      */
     @Test
-    public void testExpiryDrainsPastGhostQueueEntries() throws Exception {
-        // No max-pending eviction, so only the expiry path consumes the queue.
-        consumerConf.setMaxPendingChunkedMessage(0);
-        createConsumer(consumerConf);
-        // Enable expiry but skip the lazy self-scheduling so the test doesn't need a scheduled-executor mock.
-        consumer.expireTimeOfIncompleteChunkedMessageMillis = 1L;
-        consumer.expireChunkMessageTaskScheduled.set(true);
-
-        // uuid-A: first chunk of a 3-chunk message -> in-progress. Enqueued first (queue head).
-        sendChunk("uuid-A", 0, 3);
-        // uuid-B: first chunk of a 2-chunk message -> in-progress, enqueued after A. Never completed.
-        sendChunk("uuid-B", 0, 2);
-
-        // Plant a ghost head by hand: take uuid-A's ctx out of the map and recycle it while leaving its uuid in
-        // pendingChunkedMessageUuidQueue. (Releasing the buffer mirrors the assembled-payload release that a real
-        // completion performs.)
-        ConsumerImpl.ChunkedMessageCtx ctxA = consumer.chunkedMessagesMap.remove("uuid-A");
-        assertThat(ctxA).isNotNull();
-        if (ctxA.chunkedMsgBuffer != null) {
-            ctxA.chunkedMsgBuffer.release();
-        }
-        ctxA.recycle();
-
-        // Make uuid-B eligible for expiry right away.
-        ConsumerImpl.ChunkedMessageCtx ctxB = consumer.chunkedMessagesMap.get("uuid-B");
-        assertThat(ctxB).isNotNull();
-        ctxB.receivedTime = 0;
-        ByteBuf bufB = ctxB.chunkedMsgBuffer;
-
-        consumer.removeExpireIncompleteChunkedMessages();
-
-        // With the bug, the ghost head (uuid-A) makes expiry return before reaching the expired uuid-B.
-        assertThat(consumer.chunkedMessagesMap.containsKey("uuid-B"))
-                .as("expired incomplete chunked message behind a ghost queue head must be cleaned")
-                .isFalse();
-        assertThat(bufB.refCnt()).as("expired chunk buffer must be released").isZero();
-        assertThat(consumer.pendingChunkedMessageUuidQueue)
-                .as("ghost and expired entries must both be drained from the queue").isEmpty();
-    }
-
-    /**
-     * The "lost first chunk" / forward-gap discard path in {@code processMessageChunk} removes an in-progress ctx from
-     * {@code chunkedMessagesMap}, but must also keep the other bookkeeping in sync: decrement
-     * {@code pendingChunkedMessageCount} (the ctx was counted when its first chunk created it) and drop the uuid from
-     * {@code pendingChunkedMessageUuidQueue} (otherwise a ghost lingers). Without the decrement the count drifts upward
-     * and prematurely triggers {@code removeOldestPendingChunkedMessage}.
-     */
-    @Test
-    public void testForwardGapDiscardKeepsCountAndQueueConsistent() throws Exception {
+    public void testForwardGapDiscardRemovesInProgressCtx() throws Exception {
         // Disable the lazy expiry self-scheduling so this test doesn't need a scheduled-executor mock.
         consumer.expireTimeOfIncompleteChunkedMessageMillis = 0L;
 
         final String uuid = "uuid-gap";
-        // First chunk (chunkId 0) of a 3-chunk message -> in-progress: count=1, map={uuid}, queue=[uuid].
+        // First chunk (chunkId 0) of a 3-chunk message -> in-progress: map={uuid}.
         sendChunk(uuid, 0, 3);
         // A chunk that skips chunkId 1 (forward gap): chunkId 2 != lastChunkedMessageId(0)+1 and > lastChunkedMessageId
         // -> hits the "lost first chunk" discard path that removes the ctx from chunkedMessagesMap.
         sendChunk(uuid, 2, 3);
 
-        int count = consumer.pendingChunkedMessageCount;
-        int mapSize = consumer.chunkedMessagesMap.size();
-        Assert.assertEquals(count, mapSize,
-                "forward-gap discard over-counted pendingChunkedMessageCount (" + count
-                        + ") vs chunkedMessagesMap.size() (" + mapSize + ")");
-
-        Assert.assertEquals(consumer.pendingChunkedMessageUuidQueue.size(), mapSize,
-                "discarded uuid must be removed from pendingChunkedMessageUuidQueue (no ghost), queue size was "
-                        + consumer.pendingChunkedMessageUuidQueue.size());
+        Assert.assertEquals(consumer.chunkedMessagesMap.size(), 0,
+                "forward-gap discard must remove the in-progress ctx");
     }
 
     @Test(invocationTimeOut = 1000)
@@ -569,6 +509,393 @@ public class ConsumerImplTest {
         verify(connectionPool).releaseConnection(clientCnx);
     }
 
+    /**
+     * The broker can close the consumer while a subscribe attempt is pending, and the consumer then subscribes again
+     * on the same pooled connection. When the superseded attempt times out, the consumer must stay registered on the
+     * connection, and must neither close its consumer on the broker nor reconnect.
+     */
+    @Test
+    public void testSupersededSubscribeAttemptOnSameConnectionIsIgnored() {
+        ConsumerImpl<byte[]> subscriber = ConsumerImpl.newConsumerImpl(consumer.client,
+                "persistent://tenant/ns1/my-topic", consumerConf, executorProvider, -1, false,
+                new CompletableFuture<>(), null, Schema.BYTES, null, true);
+        ClientCnx cnx = ClientTestFixtures.mockClientCnx();
+        CompletableFuture<ProducerResponse> firstSubscribe = new CompletableFuture<>();
+        AtomicInteger requests = new AtomicInteger();
+        doAnswer(invocation -> {
+            invocation.<ByteBuf>getArgument(0).release();
+            return requests.getAndIncrement() == 0 ? firstSubscribe : CompletableFuture.completedFuture(null);
+        }).when(cnx).sendRequestWithId(any(), anyLong());
+
+        CompletableFuture<Void> firstAttempt = subscriber.connectionOpened(cnx);
+        subscriber.connectionClosed(cnx, Optional.of(0L), Optional.empty());
+        subscriber.connectionOpened(cnx).join();
+        assertThat(subscriber.isConnected()).isTrue();
+
+        firstSubscribe.completeExceptionally(new PulsarClientException.TimeoutException("subscribe timed out"));
+
+        assertThat(firstAttempt).as("a failed attempt makes the connection handler reconnect")
+                .isNotCompletedExceptionally();
+        verify(cnx, never()).removeConsumer(anyLong());
+        // Only the two subscribes: no close consumer request
+        verify(cnx, times(2)).sendRequestWithId(any(), anyLong());
+        assertThat(subscriber.isConnected()).isTrue();
+    }
+
+    /**
+     * A subscribe timeout is handled on another thread than the connection's, so the broker can close the consumer
+     * and a newer attempt can subscribe again on the same connection while the timeout is being handled. The
+     * timeout's side effects must all happen before the newer attempt subscribes.
+     */
+    @Test(timeOut = 30000)
+    public void testSubscribeTimeoutIsHandledBeforeNewerAttempt() throws Exception {
+        ConsumerImpl<byte[]> subscriber = ConsumerImpl.newConsumerImpl(consumer.client, PERSISTENT_TOPIC,
+                consumerConf, executorProvider, -1, false, new CompletableFuture<>(), null, Schema.BYTES, null, true);
+        ClientCnx cnx = ClientTestFixtures.mockClientCnx();
+        CompletableFuture<ProducerResponse> firstSubscribe = new CompletableFuture<>();
+        List<BaseCommand.Type> requests = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            ByteBuf cmd = invocation.getArgument(0);
+            requests.add(commandType(cmd));
+            cmd.release();
+            return requests.size() == 1 ? firstSubscribe : CompletableFuture.completedFuture(null);
+        }).when(cnx).sendRequestWithId(any(), anyLong());
+        Set<Long> registered = ConcurrentHashMap.newKeySet();
+        doAnswer(invocation -> registered.add(invocation.getArgument(0))).when(cnx)
+                .registerConsumer(anyLong(), any());
+        CountDownLatch timeoutPaused = new CountDownLatch(1);
+        CountDownLatch resumeTimeout = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            timeoutPaused.countDown();
+            resumeTimeout.await();
+            return registered.remove(invocation.getArgument(0));
+        }).when(cnx).removeConsumer(anyLong());
+
+        subscriber.connectionOpened(cnx);
+        Thread timeout = new Thread(() -> firstSubscribe.completeExceptionally(
+                new PulsarClientException.TimeoutException("subscribe timed out")));
+        timeout.start();
+        assertThat(timeoutPaused.await(10, TimeUnit.SECONDS)).isTrue();
+        // While the timeout is being handled, the broker closes the consumer, and a newer attempt starts
+        subscriber.connectionClosed(cnx, Optional.of(0L), Optional.empty());
+        Thread newerAttempt = new Thread(() -> subscriber.connectionOpened(cnx).join());
+        newerAttempt.start();
+        Awaitility.await().until(() -> newerAttempt.getState() == Thread.State.BLOCKED || requests.size() > 1);
+        resumeTimeout.countDown();
+        timeout.join();
+        newerAttempt.join();
+
+        assertThat(requests).containsExactly(BaseCommand.Type.SUBSCRIBE, BaseCommand.Type.CLOSE_CONSUMER,
+                BaseCommand.Type.SUBSCRIBE);
+        assertThat(registered).as("the newer attempt's registration").containsExactly(subscriber.consumerId);
+        assertThat(subscriber.isConnected()).isTrue();
+    }
+
+    @Test
+    public void testReconnectSendsPendingAcksBeforeFlowPermits() {
+        // The acks grouped before the reconnection must reach the broker before the permits. The broker dispatches
+        // as soon as it has permits, and the flush empties the pending acks that the duplicate check uses, so the
+        // messages it would redeliver before the acks arrive would reach the application again.
+        consumerConf = new ConsumerConfigurationData<>();
+        consumerConf.setAcknowledgementsGroupTimeMicros(TimeUnit.HOURS.toMicros(1));
+        createConsumer(consumerConf, PERSISTENT_TOPIC, null, Schema.BYTES);
+
+        assertThat(reconnectWithPendingAck()).containsExactly(BaseCommand.Type.ACK, BaseCommand.Type.FLOW);
+    }
+
+    @Test
+    public void testZeroQueueReconnectSendsPendingAcksBeforeFlowPermits() {
+        // A zero-queue consumer sends the permit for a pending receive while it switches to Ready: the acks must
+        // go out before that permit too.
+        consumerConf = new ConsumerConfigurationData<>();
+        consumerConf.setAcknowledgementsGroupTimeMicros(TimeUnit.HOURS.toMicros(1));
+        consumerConf.setReceiverQueueSize(0);
+        createConsumer(consumerConf, PERSISTENT_TOPIC, null, Schema.BYTES);
+        consumer.pendingReceives.add(new CompletableFuture<>());
+
+        assertThat(reconnectWithPendingAck()).containsExactly(BaseCommand.Type.ACK, BaseCommand.Type.FLOW);
+    }
+
+    @Test
+    public void testReconnectFlushDoesNotWaitForListAckInterceptors() throws Exception {
+        // With ack receipts, recording a list ack takes the tracker's receipt lock, and the reconnection flushes the
+        // acks under the consumer's lock. The interceptors must run outside the receipt lock: one that takes the
+        // consumer's lock, here by asking for redelivery, would otherwise deadlock with the flush.
+        CountDownLatch interceptorEntered = new CountDownLatch(1);
+        CountDownLatch interceptorRelease = new CountDownLatch(1);
+        ConsumerInterceptor<byte[]> interceptor = mock(ConsumerInterceptor.class);
+        doAnswer(invocation -> {
+            interceptorEntered.countDown();
+            interceptorRelease.await();
+            invocation.<Consumer<byte[]>>getArgument(0).redeliverUnacknowledgedMessages();
+            return null;
+        }).when(interceptor).onAcknowledge(any(), any(), any());
+        consumerConf = new ConsumerConfigurationData<>();
+        consumerConf.setAcknowledgementsGroupTimeMicros(TimeUnit.HOURS.toMicros(1));
+        consumerConf.setAckReceiptEnabled(true);
+        createConsumer(consumerConf, PERSISTENT_TOPIC, interceptor, Schema.BYTES);
+        ClientCnx cnx = ClientTestFixtures.mockClientCnx();
+        doReturn(Commands.getCurrentProtocolVersion()).when(cnx).getRemoteEndpointProtocolVersion();
+        // Reconnecting, with the subscribe in flight on the new connection.
+        consumer.setState(HandlerState.State.Connecting);
+        consumer.setClientCnx(cnx);
+
+        CompletableFuture<Void> acknowledged = runInDaemonThread("list-ack",
+                () -> consumer.acknowledgeAsync(List.of(new MessageIdImpl(1, 1, -1))));
+        assertThat(interceptorEntered.await(10, TimeUnit.SECONDS)).isTrue();
+        try {
+            // The subscription completes while the interceptor runs: the flush must not wait for it.
+            assertThat(runInDaemonThread("reconnect", () -> consumer.connectionOpened(cnx).join()))
+                    .succeedsWithin(10, TimeUnit.SECONDS);
+        } finally {
+            interceptorRelease.countDown();
+        }
+        // The interceptor then takes the consumer's lock to redeliver, and the acknowledgment completes.
+        assertThat(acknowledged).succeedsWithin(10, TimeUnit.SECONDS);
+    }
+
+    // Acks a message with the grouping delay pending, then reconnects the consumer on a mocked connection and
+    // returns the types of the commands it writes there.
+    private List<BaseCommand.Type> reconnectWithPendingAck() {
+        consumer.acknowledgeAsync(new MessageIdImpl(1, 1, -1)).join();
+
+        ClientCnx cnx = ClientTestFixtures.mockClientCnx();
+        doReturn(Commands.getCurrentProtocolVersion()).when(cnx).getRemoteEndpointProtocolVersion();
+        ChannelHandlerContext ctx = cnx.ctx();
+        List<BaseCommand.Type> written = new ArrayList<>();
+        ChannelHandlerContext recordingCtx = mock(ChannelHandlerContext.class);
+        doAnswer(invocation -> {
+            written.add(commandType(invocation.getArgument(0)));
+            return ctx.writeAndFlush(invocation.getArgument(0));
+        }).when(recordingCtx).writeAndFlush(any());
+        doAnswer(invocation -> {
+            written.add(commandType(invocation.getArgument(0)));
+            return ctx.writeAndFlush(invocation.getArgument(0), invocation.getArgument(1));
+        }).when(recordingCtx).writeAndFlush(any(), any());
+        doReturn(recordingCtx).when(cnx).ctx();
+
+        consumer.setState(HandlerState.State.Connecting);
+        consumer.connectionOpened(cnx).join();
+        return written;
+    }
+
+    // A daemon thread, so that a test failing on a deadlock doesn't keep the JVM running.
+    private static CompletableFuture<Void> runInDaemonThread(String name, Runnable task) {
+        CompletableFuture<Void> done = new CompletableFuture<>();
+        Thread thread = new Thread(() -> {
+            try {
+                task.run();
+                done.complete(null);
+            } catch (Throwable t) {
+                done.completeExceptionally(t);
+            }
+        }, name);
+        thread.setDaemon(true);
+        thread.start();
+        return done;
+    }
+
+    private static BaseCommand.Type commandType(ByteBuf frame) {
+        ByteBuf view = frame.duplicate();
+        view.skipBytes(4); // total frame size
+        int commandSize = view.readInt();
+        BaseCommand command = new BaseCommand();
+        command.parseFrom(view, commandSize);
+        return command.getType();
+    }
+
+    @DataProvider
+    public static Object[][] subscriptionModes() {
+        return new Object[][]{{SubscriptionMode.Durable}, {SubscriptionMode.NonDurable}};
+    }
+
+    @Test(dataProvider = "subscriptionModes")
+    public void testClearReceiverQueueDiscardsQueuedMessages(SubscriptionMode subscriptionMode) {
+        // On reconnection, clearReceiverQueue() used to return early for Durable subscriptions without releasing
+        // the drained messages.
+        consumerConf = new ConsumerConfigurationData<>();
+        consumerConf.setSubscriptionMode(subscriptionMode);
+        // a Durable subscription on a non-persistent topic is turned into a NonDurable one
+        createConsumer(consumerConf, "persistent://tenant/ns1/my-topic");
+        List<MessageImpl<byte[]>> messages = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            MessageImpl<byte[]> message = mockIncomingMessage(i);
+            messages.add(message);
+            consumer.enqueueMessageAndCheckBatchReceive(message);
+        }
+        assertThat(consumer.getIncomingMessageSize()).isEqualTo(300);
+
+        consumer.clearReceiverQueue(true);
+
+        assertThat(consumer.getTotalIncomingMessages()).isZero();
+        assertThat(consumer.getIncomingMessageSize()).isZero();
+        for (MessageImpl<byte[]> message : messages) {
+            verify(message).release();
+        }
+    }
+
+    @Test
+    public void testCloseNotConnectedConsumerClosesInterceptorsOnce() throws Exception {
+        ConsumerInterceptor<byte[]> interceptor = mock(ConsumerInterceptor.class);
+        createConsumer(new ConsumerConfigurationData<>(), topic, interceptor);
+
+        consumer.closeAsync().get(5, TimeUnit.SECONDS);
+        consumer.closeAsync().get(5, TimeUnit.SECONDS);
+
+        verify(interceptor).close();
+    }
+
+    @Test
+    public void testMessageEnqueuedAfterCloseIsDiscarded() {
+        consumerConf = new ConsumerConfigurationData<>();
+        consumerConf.setAutoScaledReceiverQueueSizeEnabled(true);
+        createConsumer(consumerConf);
+        MemoryLimitController memoryLimitController = new MemoryLimitController(Long.MAX_VALUE);
+        when(consumer.client.getMemoryLimitController()).thenReturn(memoryLimitController);
+        // not connected, so the consumer is closed and its incoming queue terminated synchronously
+        consumer.closeAsync();
+
+        MessageImpl<byte[]> message = mockIncomingMessage(0);
+        consumer.enqueueMessageAndCheckBatchReceive(message);
+
+        verify(message).release();
+        assertThat(consumer.getTotalIncomingMessages()).isZero();
+        assertThat(consumer.getIncomingMessageSize()).isZero();
+        assertThat(memoryLimitController.currentUsage()).isZero();
+    }
+
+    @Test(timeOut = 30000)
+    public void testClearIncomingMessagesConcurrentWithEnqueueAndReceive() throws Exception {
+        // Shared and Key_Shared subscriptions use a no-op incomingQueueLock, so clearIncomingMessages() (called by
+        // redeliverUnacknowledgedMessages()) runs concurrently with messages being enqueued by the IO thread and
+        // received by the application. Every message must be released exactly once and the incoming message size
+        // and the memory limit usage must go back to zero.
+        consumerConf = new ConsumerConfigurationData<>();
+        consumerConf.setSubscriptionType(SubscriptionType.Shared);
+        consumerConf.setAutoScaledReceiverQueueSizeEnabled(true);
+        createConsumer(consumerConf);
+        ConsumerImpl<byte[]> consumer = this.consumer;
+        MemoryLimitController memoryLimitController = new MemoryLimitController(Long.MAX_VALUE);
+        when(consumer.client.getMemoryLimitController()).thenReturn(memoryLimitController);
+
+        int numMessages = 20000;
+        AtomicIntegerArray releaseCounts = new AtomicIntegerArray(numMessages);
+        List<MessageImpl<byte[]>> messages = new ArrayList<>(numMessages);
+        for (int i = 0; i < numMessages; i++) {
+            int index = i;
+            MessageImpl<byte[]> message = mock(MessageImpl.class, withSettings().stubOnly());
+            when(message.size()).thenReturn(100);
+            doAnswer(invocation -> releaseCounts.incrementAndGet(index)).when(message).release();
+            messages.add(message);
+        }
+
+        AtomicBoolean enqueueDone = new AtomicBoolean();
+        AtomicInteger discardedCount = new AtomicInteger();
+        CyclicBarrier startBarrier = new CyclicBarrier(3);
+        Thread enqueueThread = new Thread(() -> {
+            try {
+                startBarrier.await();
+                messages.forEach(consumer::enqueueMessageAndCheckBatchReceive);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            } finally {
+                enqueueDone.set(true);
+            }
+        });
+        Thread receiveThread = new Thread(() -> {
+            try {
+                startBarrier.await();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            while (!enqueueDone.get()) {
+                Message<byte[]> message = consumer.incomingMessages.poll();
+                if (message != null) {
+                    // what messageProcessed() and the application do for a received message
+                    consumer.discardIncomingMessage(message);
+                    discardedCount.incrementAndGet();
+                }
+            }
+        });
+        enqueueThread.start();
+        receiveThread.start();
+        try {
+            startBarrier.await(10, TimeUnit.SECONDS);
+            while (!enqueueDone.get()) {
+                discardedCount.addAndGet(consumer.clearIncomingMessages());
+            }
+        } finally {
+            enqueueDone.set(true);
+            enqueueThread.join();
+            receiveThread.join();
+        }
+        discardedCount.addAndGet(consumer.clearIncomingMessages());
+
+        // the returned counts are used for the permits sent back to the broker
+        assertThat(discardedCount.get()).isEqualTo(numMessages);
+        for (int i = 0; i < numMessages; i++) {
+            assertThat(releaseCounts.get(i)).as("release count of message %d", i).isEqualTo(1);
+        }
+        assertThat(consumer.getIncomingMessageSize()).isZero();
+        assertThat(memoryLimitController.currentUsage()).isZero();
+    }
+
+    @Test(timeOut = 30000)
+    public void testBatchReceiveChecksAndDequeuesMessageAtomically() throws Exception {
+        // A batch receive checks whether the message at the head of the queue fits in the batch before dequeuing
+        // it. A concurrent clear of the queue (for example on reconnection) must not dequeue and release that
+        // message in between: the size of a released pooled message can't be read, since its payload is gone.
+        consumerConf = new ConsumerConfigurationData<>();
+        consumerConf.setBatchReceivePolicy(BatchReceivePolicy.builder()
+                .maxNumMessages(10).maxNumBytes(1024 * 1024).timeout(1, TimeUnit.SECONDS).build());
+        createConsumer(consumerConf);
+        ConsumerImpl<byte[]> consumer = this.consumer;
+        MessageImpl<byte[]> first = mockIncomingMessage(0);
+        MessageImpl<byte[]> second = mockIncomingMessage(1);
+        consumer.enqueueMessageAndCheckBatchReceive(first);
+        consumer.enqueueMessageAndCheckBatchReceive(second);
+
+        AtomicBoolean secondReleased = new AtomicBoolean();
+        doAnswer(invocation -> {
+            secondReleased.set(true);
+            return null;
+        }).when(second).release();
+        AtomicInteger clearedCount = new AtomicInteger();
+        Thread clearThread = new Thread(() -> clearedCount.set(consumer.clearIncomingMessages()));
+        AtomicBoolean clearStarted = new AtomicBoolean();
+        // the first size check of the second message clears the queue concurrently
+        when(second.size()).thenAnswer(invocation -> {
+            if (clearStarted.compareAndSet(false, true)) {
+                clearThread.start();
+                // the clear can't dequeue the message while the batch receive checks it
+                clearThread.join(500);
+            }
+            if (secondReleased.get()) {
+                throw new NullPointerException("payload of a released message");
+            }
+            return 100;
+        });
+
+        CompletableFuture<Messages<byte[]>> future = new CompletableFuture<>();
+        consumer.notifyPendingBatchReceivedCallBack(future);
+        clearThread.join();
+
+        assertThat(clearStarted).isTrue();
+        assertThat(future).isCompleted();
+        assertThat(future.join()).containsExactly(first, second);
+        assertThat(clearedCount.get()).isZero();
+        assertThat(secondReleased).isFalse();
+        assertThat(consumer.getIncomingMessageSize()).isZero();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static MessageImpl<byte[]> mockIncomingMessage(long entryId) {
+        MessageImpl<byte[]> message = mock(MessageImpl.class);
+        when(message.size()).thenReturn(100);
+        when(message.getMessageId()).thenReturn(new MessageIdImpl(1, entryId, -1));
+        return message;
+    }
+
     @Test
     public void testConsumerCreatedWhilePaused() throws InterruptedException {
         PulsarClientImpl client = ClientTestFixtures.createPulsarClientMock(executorProvider, internalExecutor);
@@ -605,7 +932,8 @@ public class ConsumerImplTest {
         int permits = consumer.getAvailablePermits();
         consumer.setCurrentReceiverQueueSize(size + 100);
         Assert.assertEquals(consumer.getCurrentReceiverQueueSize(), size + 100);
-        Assert.assertEquals(consumer.getAvailablePermits(), permits + 100);
+        // Capacity changes before subscription are included in the initial grant, rather than added twice.
+        Assert.assertEquals(consumer.getAvailablePermits(), permits);
     }
 
     @Test
@@ -894,8 +1222,6 @@ public class ConsumerImplTest {
 
     private static void assertNoPendingChunkedMessages(ConsumerImpl<?> consumer) {
         assertThat(consumer.chunkedMessagesMap).as("chunkedMessagesMap").isEmpty();
-        assertThat(consumer.pendingChunkedMessageUuidQueue).as("pendingChunkedMessageUuidQueue").isEmpty();
-        assertThat(consumer.pendingChunkedMessageCount).as("pendingChunkedMessageCount").isZero();
     }
 
     /**
@@ -1049,7 +1375,7 @@ public class ConsumerImplTest {
     /**
      * A first chunk arriving under a new message id for a uuid that still has an in-progress context means the earlier
      * chunks belong to a corrupted chunked message that will never be delivered. Replacing the context must ack those
-     * earlier chunk ids, through the deferred-ack path, and leave the count and queue consistent with the map.
+     * earlier chunk ids, through the deferred-ack path, and leave a single in-progress context in the map.
      */
     @Test(timeOut = 30000)
     public void testReplacedCorruptedChunkedMessageAcksItsEarlierChunks() throws Exception {
@@ -1069,8 +1395,6 @@ public class ConsumerImplTest {
                     .containsExactly(new MessageIdImpl(1L, 10L, -1), new MessageIdImpl(1L, 11L, -1));
             assertThat(corruptedBuffer.refCnt()).as("replaced buffer released").isZero();
             assertThat(consumer.chunkedMessagesMap).containsOnlyKeys("uuid-corrupt");
-            assertThat(consumer.pendingChunkedMessageCount).isEqualTo(1);
-            assertThat(consumer.pendingChunkedMessageUuidQueue.size()).isEqualTo(1);
         } finally {
             releasePendingChunkedMessages();
         }
@@ -1079,7 +1403,7 @@ public class ConsumerImplTest {
     /**
      * Exceeding {@code maxPendingChunkedMessage} evicts the oldest in-progress chunked message on the receive path.
      * With {@code autoAckOldestChunkedMessageOnQueueFull} its chunk ids are acked, through the deferred-ack path, and
-     * the eviction keeps the count and queue consistent with the map.
+     * only the newer message stays in the map.
      */
     @Test(timeOut = 30000)
     public void testEvictingOldestPendingChunkedMessageAcksItsChunks() throws Exception {
@@ -1099,8 +1423,6 @@ public class ConsumerImplTest {
                     .containsExactly(new MessageIdImpl(1L, 10L, -1));
             assertThat(oldBuffer.refCnt()).as("evicted buffer released").isZero();
             assertThat(consumer.chunkedMessagesMap).containsOnlyKeys("uuid-new");
-            assertThat(consumer.pendingChunkedMessageCount).isEqualTo(1);
-            assertThat(consumer.pendingChunkedMessageUuidQueue.size()).isEqualTo(1);
         } finally {
             releasePendingChunkedMessages();
         }
@@ -1192,9 +1514,8 @@ public class ConsumerImplTest {
         consumer.pause();
         Assert.assertTrue(consumer.paused, "consumer should be paused");
 
-        // Accumulate permits by enlarging the receiver queue
-        int queueSize = consumer.getCurrentReceiverQueueSize();
-        consumer.setCurrentReceiverQueueSize(queueSize + 100);
+        // Return consumed-message permits while paused, independently of subscription initialization.
+        consumer.increaseAvailablePermits(cnx, 100);
         int permitsBeforeResume = consumer.getAvailablePermits();
         Assert.assertTrue(permitsBeforeResume > 0,
                 "should have accumulated permits while paused, got " + permitsBeforeResume);
