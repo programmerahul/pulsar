@@ -1934,8 +1934,8 @@ public class ServerCnxTest {
         resetChannel();
         setChannelConnected();
 
-        CompletableFuture<Topic> delayFuture = new CompletableFuture<>();
-        doReturn(delayFuture).when(brokerService).getOrCreateTopic(any(String.class));
+        CompletableFuture<Optional<Topic>> delayFuture = new CompletableFuture<>();
+        doReturn(delayFuture).when(brokerService).getTopicCreatingIfAllowed(any(TopicName.class), any());
         // Create producer first time
         ByteBuf clientCommand = Commands.newProducer(successTopicName, 1 /* producer id */, 1 /* request id */,
                 "prod-name", Collections.emptyMap(), false);
@@ -2339,7 +2339,7 @@ public class ServerCnxTest {
 
         Object response;
 
-        // Sending multiple subscribe commands for the same consumer should succeed
+        // A second subscribe command for a live consumer closes it and asks the client to retry
 
         ByteBuf subscribe1 = Commands.newSubscribe(successTopicName, //
                 successSubName, 1 /* consumer id */, 1 /* request id */, SubType.Exclusive, 0,
@@ -2356,10 +2356,22 @@ public class ServerCnxTest {
                 "test" /* consumer name */, 0 /* avoid reseting cursor */);
         channel.writeInbound(subscribe2);
 
-        // 2nd subscribe succeeds
+        // 2nd subscribe fails with a retriable error, and the existing consumer is closed
+        response = getResponse();
+        assertEquals(response.getClass(), CommandError.class);
+        assertEquals(((CommandError) response).getRequestId(), 2);
+        assertEquals(((CommandError) response).getError(), ServerError.ServiceNotReady);
+        assertFalse(serverCnx.getConsumers().containsKey(1L));
+
+        ByteBuf subscribe3 = Commands.newSubscribe(successTopicName, //
+                successSubName, 1 /* consumer id */, 3 /* request id */, SubType.Exclusive, 0,
+                "test" /* consumer name */, 0 /* avoid reseting cursor */);
+        channel.writeInbound(subscribe3);
+
+        // The retry creates a new consumer
         response = getResponse();
         assertEquals(response.getClass(), CommandSuccess.class);
-        assertEquals(((CommandSuccess) response).getRequestId(), 2);
+        assertEquals(((CommandSuccess) response).getRequestId(), 3);
 
         channel.finish();
     }
@@ -2945,6 +2957,8 @@ public class ServerCnxTest {
         doReturn(CompletableFuture.completedFuture(true)).when(authorizationService)
                 .allowTopicOperationAsync(Mockito.any(),
                         Mockito.any(), Mockito.any(), Mockito.any(), Mockito.any(), Mockito.any());
+        doReturn(CompletableFuture.completedFuture(true)).when(authorizationService)
+                .allowTopicAutoCreationAsync(Mockito.any(), Mockito.any(), Mockito.any(), Mockito.any(), Mockito.any());
         doReturn(authorizationService).when(brokerService).getAuthorizationService();
         svcConfig.setAuthenticationEnabled(true);
         svcConfig.setAuthorizationEnabled(true);
@@ -3026,6 +3040,38 @@ public class ServerCnxTest {
         // cursor is mocked
         // verify nothing is sent out on the wire after ack
         assertNull(channel.outboundMessages().peek());
+        channel.finish();
+    }
+
+    @Test(timeOut = 30000)
+    public void testGetLastMessageIdAsyncFailureRepliesWithOriginalRequestId() throws Exception {
+        CompletableFuture<Position> lastDispatchablePositionFuture = new CompletableFuture<>();
+        doReturn(lastDispatchablePositionFuture).when(ledgerMock)
+                .getLastDispatchablePosition(any(), any());
+
+        resetChannel();
+        setChannelConnected();
+
+        ByteBuf clientCommand = Commands.newSubscribe(successTopicName, successSubName, //
+                1 /* consumer id */, 1 /* request id */, SubType.Exclusive, 0, "test" /* consumer name */,
+                0 /* avoid reseting cursor */);
+        channel.writeInbound(clientCommand);
+        assertTrue(getResponse() instanceof CommandSuccess);
+
+        long getLastMessageIdRequestId = 42;
+        channel.writeInbound(Commands.newGetLastMessageId(1 /* consumer id */, getLastMessageIdRequestId));
+        assertNull(channel.outboundMessages().peek());
+
+        // The next frame on the same connection makes the decoder clear and reuse its command object
+        channel.writeInbound(Commands.newFlow(1 /* consumer id */, 1 /* message permits */));
+
+        lastDispatchablePositionFuture.completeExceptionally(new RuntimeException("injected failure"));
+
+        Object response = getResponse();
+        assertThat(response).isInstanceOfSatisfying(CommandError.class, error -> {
+            assertThat(error.getRequestId()).isEqualTo(getLastMessageIdRequestId);
+            assertThat(error.getError()).isEqualTo(ServerError.UnknownError);
+        });
         channel.finish();
     }
     @SuppressWarnings("deprecation")
@@ -3588,8 +3634,8 @@ public class ServerCnxTest {
         resetChannel();
         setChannelConnected();
 
-        CompletableFuture<Topic> delayFuture = new CompletableFuture<>();
-        doReturn(delayFuture).when(brokerService).getOrCreateTopic(any(String.class));
+        CompletableFuture<Optional<Topic>> delayFuture = new CompletableFuture<>();
+        doReturn(delayFuture).when(brokerService).getTopicCreatingIfAllowed(any(TopicName.class), any());
         // Create producer first time
         int producerId = 1;
         ByteBuf clientCommand = Commands.newProducer(successTopicName, producerId /* producer id */, 1 /* request id */,
@@ -3600,7 +3646,8 @@ public class ServerCnxTest {
         channel.writeInbound(closeProducerCmd);
 
         Topic topic = mock(Topic.class);
-        doReturn(CompletableFuture.completedFuture(topic)).when(brokerService).getOrCreateTopic(any(String.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(topic))).when(brokerService)
+                .getTopicCreatingIfAllowed(any(TopicName.class), any());
         doReturn(CompletableFuture.completedFuture(false)).when(topic).hasSchema();
 
         clientCommand = Commands.newProducer(successTopicName, producerId /* producer id */, 1 /* request id */,
@@ -3862,8 +3909,14 @@ public class ServerCnxTest {
                     }
                     return false;
                 };
-                // assert no consumer-delete event occur
-                assertFalse(deleteTimesMark.getAllValues().contains(existingConsumerFuture));
+                if (futureWillDoneAfterDelayTimes.intValue() == 1) {
+                    // already complete: the existing consumer is closed before its future is removed
+                    Mockito.verify(mockConsumer).close();
+                    assertTrue(deleteTimesMark.getAllValues().contains(existingConsumerFuture));
+                } else {
+                    // not complete yet: assert no consumer-delete event occur
+                    assertFalse(deleteTimesMark.getAllValues().contains(existingConsumerFuture));
+                }
                 // assert without another error occur
                 assertTrue(responseAssert.test(responseAssert));
                 // Server will not close the connection
@@ -4127,12 +4180,11 @@ public class ServerCnxTest {
 
     @DataProvider
     public Object[][] partitionMetadataPolicyFailures() {
-        return new Object[][]{{true, true}, {true, false}, {false, true}, {false, false}};
+        return new Object[][]{{true}, {false}};
     }
 
     @Test(dataProvider = "partitionMetadataPolicyFailures", timeOut = 30000)
-    public void testPartitionMetadataPolicyFailure(boolean metadataAutoCreationEnabled, boolean alreadyFailed)
-            throws Exception {
+    public void testPartitionMetadataPolicyFailure(boolean alreadyFailed) throws Exception {
         resetChannel();
         channel.writeInbound(Commands.newConnect("none", "", null));
         assertThat(getResponse()).isInstanceOf(CommandConnected.class);
@@ -4148,8 +4200,7 @@ public class ServerCnxTest {
                 policyFuture.completeExceptionally(failure);
             }
 
-            channel.writeInbound(Commands.newPartitionMetadataRequest(successTopicName, requestId,
-                    metadataAutoCreationEnabled));
+            channel.writeInbound(Commands.newPartitionMetadataRequest(successTopicName, requestId, true));
             if (!alreadyFailed) {
                 assertThat(lookupSemaphore.availablePermits()).isEqualTo(initialPermits - 1);
                 assertThat(channel.outboundMessages()).isEmpty();
@@ -4166,6 +4217,31 @@ public class ServerCnxTest {
             assertThat(channel.outboundMessages()).isEmpty();
         }
         verify(namespaceService, never()).checkTopicExistsAsync(topicName);
+        channel.finishAndReleaseAll();
+    }
+
+    @Test(timeOut = 30000)
+    public void testPartitionMetadataWithoutAutoCreationSkipsCreationPolicy() throws Exception {
+        resetChannel();
+        channel.writeInbound(Commands.newConnect("none", "", null));
+        assertThat(getResponse()).isInstanceOf(CommandConnected.class);
+
+        TopicName topicName = TopicName.get(successTopicName);
+        // Consulting the auto-creation policy would fail the request with a MetadataError.
+        doReturn(CompletableFuture.failedFuture(new MetadataStoreException("Namespace policy read failed")))
+                .when(brokerService).isAllowAutoTopicCreationAsync(topicName);
+        TopicExistsInfo topicExistsInfo = mock(TopicExistsInfo.class);
+        when(topicExistsInfo.isExists()).thenReturn(true);
+        when(topicExistsInfo.getTopicType()).thenReturn(TopicType.PARTITIONED);
+        when(topicExistsInfo.getPartitions()).thenReturn(3);
+        doReturn(CompletableFuture.completedFuture(topicExistsInfo)).when(namespaceService)
+                .checkTopicExistsAsync(topicName);
+
+        channel.writeInbound(Commands.newPartitionMetadataRequest(successTopicName, 1, false));
+        channel.runPendingTasks();
+        CommandPartitionedTopicMetadataResponse response = (CommandPartitionedTopicMetadataResponse) getResponse();
+        assertThat(response.hasError()).as("error of a lookup that does not ask for auto-creation").isFalse();
+        assertThat(response.getPartitions()).isEqualTo(3);
         channel.finishAndReleaseAll();
     }
 
@@ -4311,6 +4387,8 @@ public class ServerCnxTest {
         CompletableFuture<Boolean> authorizationFuture = new CompletableFuture<>();
         doReturn(authorizationFuture).when(authorizationService)
                 .allowTopicOperationAsync(any(), any(), any(), any(), any(), any());
+        doReturn(CompletableFuture.completedFuture(true)).when(authorizationService)
+                .allowTopicAutoCreationAsync(any(), any(), any(), any(), any());
 
         TopicName topicName = TopicName.get(successTopicName);
         Policies policies = new Policies();
@@ -4333,7 +4411,7 @@ public class ServerCnxTest {
         doAnswer(invocation -> {
             lookupStarted.complete(null);
             return metadataFuture;
-        }).when(brokerService).fetchPartitionedTopicMetadataCheckAllowAutoCreationAsync(topicName);
+        }).when(brokerService).fetchPartitionedTopicMetadataCheckAllowAutoCreationAsync(eq(topicName), any());
 
         var lookupSemaphore = brokerService.getLookupRequestSemaphore();
         int initialPermits = lookupSemaphore.availablePermits();
@@ -4417,7 +4495,7 @@ public class ServerCnxTest {
             doAnswer(invocation -> {
                 lookupStarted.complete(null);
                 return metadataFuture;
-            }).when(brokerService).fetchPartitionedTopicMetadataCheckAllowAutoCreationAsync(topicName);
+            }).when(brokerService).fetchPartitionedTopicMetadataCheckAllowAutoCreationAsync(eq(topicName), any());
         } else {
             doReturn(existingTopicFuture).when(namespaceService).checkTopicExistsAsync(topicName);
         }
